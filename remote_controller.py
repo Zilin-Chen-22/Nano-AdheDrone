@@ -30,14 +30,20 @@ STICK_DEADZONE = 0.01
 TARGET_DIST = 0.3
 TAG_HOLD_DURATION = 0.05
 
-# Tag 丢失后的安全油门（归一化值，对应 RC 1400，即 (1400-1500)/500 = -0.2）
+# Tag 丢失后的安全油门（归一化值，对应 RC 1400）
 TAG_LOST_THROTTLE = -0.2
+
+# 自动降落触发条件
+LAND_DIST_MIN   = 0.3    # 触发距离下限（米）
+LAND_DIST_MAX   = 0.4    # 触发距离上限（米）
+LAND_ERR_MAX    = 0.1    # XY 方向误差上限（归一化）
+LAND_THRUST_DUR = 1.0    # 满推力持续时间（秒）
 
 # 各轴 PID 参数（运行时可在界面调整）
 pid_params = {
-    "THRO":  [0.45,  0.1,  0.15],
-    "PITCH": [0.70,  0.0,  0.08],
-    "ROLL":  [0.70,  0.0,  0.08],
+    "THRO":  [0.45,  0.120,  0.10],
+    "PITCH": [0.72,  0.004,  0.06],
+    "ROLL":  [0.72,  0.004,  0.06],
 }
 
 # 各轴 PID 输出限幅（归一化 [-1, 1]）
@@ -218,11 +224,37 @@ err_pitch_disp    = 0.0
 err_throttle_disp = 0.0
 current_dist      = 0.0
 
+# ========= 自动降落序列状态 =========
+# land_state: None → "thrusting" → 自动 disarm
+land_state      = None
+land_thrust_start = None   # 满推力开始时间
+
+
+def abort_land():
+    """中断降落序列，重置状态"""
+    global land_state, land_thrust_start
+    land_state = None
+    land_thrust_start = None
+
+
+def do_disarm():
+    """执行 disarm 并重置所有相关状态"""
+    global armed, arm_request, auto_on, land_state, land_thrust_start
+    arm_request = False
+    armed = False
+    auto_on = False
+    pid_throttle.reset()
+    pid_pitch.reset()
+    pid_roll.reset()
+    last_pid_out[0] = 0.0
+    last_pid_out[1] = 0.0
+    last_pid_out[2] = -1.0
+    abort_land()
+
+
 # ========= PID 编辑器状态 =========
-# 编辑区：行 = THRO/PITCH/ROLL，列 = Kp/Ki/Kd
-# selected_cell = (row, col) 或 None
 selected_cell = None
-edit_buffer   = ""   # 当前正在输入的字符串
+edit_buffer   = ""
 
 PID_EDITOR_X  = 510
 PID_EDITOR_Y  = 290
@@ -231,16 +263,18 @@ PID_COL_W     = 68
 PID_ROWS      = ["THRO", "PITCH", "ROLL"]
 PID_COLS      = ["Kp", "Ki", "Kd"]
 
+
 def get_pid_cell_rect(row, col):
     x = PID_EDITOR_X + 52 + col * PID_COL_W
     y = PID_EDITOR_Y + 22 + row * PID_ROW_H
     return pygame.Rect(x, y, PID_COL_W - 4, PID_ROW_H - 2)
 
+
 def apply_pid_params():
-    """将 pid_params 字典同步到三个 PID 实例"""
     pid_throttle.set_gains(*pid_params["THRO"])
     pid_pitch.set_gains(*pid_params["PITCH"])
     pid_roll.set_gains(*pid_params["ROLL"])
+
 
 # ========= 主循环 =========
 while running:
@@ -253,10 +287,8 @@ while running:
             running = False
 
         elif event.type == pygame.KEYDOWN:
-            # --- PID 编辑器输入（disarm 状态下）---
             if selected_cell is not None and not armed:
                 if event.key == pygame.K_RETURN or event.key == pygame.K_KP_ENTER:
-                    # 提交
                     try:
                         val = float(edit_buffer)
                         row, col = selected_cell
@@ -266,21 +298,15 @@ while running:
                         pass
                     selected_cell = None
                     edit_buffer = ""
-
                 elif event.key == pygame.K_ESCAPE:
                     selected_cell = None
                     edit_buffer = ""
-
                 elif event.key == pygame.K_BACKSPACE:
                     edit_buffer = edit_buffer[:-1]
-
                 else:
-                    # 只允许数字、小数点、负号
                     if event.unicode in "0123456789.-":
                         edit_buffer += event.unicode
-
             else:
-                # 摄像头切换
                 if event.key == pygame.K_1:
                     switch_camera(0)
                 elif event.key == pygame.K_2:
@@ -291,7 +317,7 @@ while running:
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mx, my = event.pos
 
-            # --- PID 编辑器点击（仅 disarm）---
+            # PID 编辑器点击（仅 disarm）
             if not armed:
                 clicked_cell = False
                 for r in range(len(PID_ROWS)):
@@ -305,34 +331,36 @@ while running:
                     if clicked_cell:
                         break
                 if not clicked_cell:
-                    # 点击编辑器外部，取消选中
                     selected_cell = None
                     edit_buffer = ""
 
+            # ARM 按钮（最高优先级，可中断降落序列）
             if arm_rect.collidepoint(mx, my):
                 if armed:
-                    arm_request = False
-                    if auto_on:
-                        auto_on = False
-                        pid_throttle.reset()
-                        pid_pitch.reset()
-                        pid_roll.reset()
-                        last_pid_out = [0.0, 0.0, -1.0]
+                    # 手动 disarm，中断一切
+                    do_disarm()
                 else:
                     if throttle_low:
                         arm_request = True
 
-            if angle_rect.collidepoint(mx, my):
-                angle_on = not angle_on
-
+            # AUTO 按钮（可中断降落序列）
             if auto_rect.collidepoint(mx, my):
                 if armed:
-                    auto_on = not auto_on
-                    if not auto_on:
+                    if auto_on:
+                        # 手动关闭 auto，中断降落序列
+                        auto_on = False
+                        abort_land()
                         pid_throttle.reset()
                         pid_pitch.reset()
                         pid_roll.reset()
-                        last_pid_out = [0.0, 0.0, -1.0]
+                        last_pid_out[0] = 0.0
+                        last_pid_out[1] = 0.0
+                        last_pid_out[2] = -1.0
+                    else:
+                        auto_on = True
+
+            if angle_rect.collidepoint(mx, my):
+                angle_on = not angle_on
 
             for i in range(4):
                 rect = pygame.Rect(
@@ -428,25 +456,38 @@ while running:
                 err_pitch_disp    = err_pitch
                 err_roll_disp     = err_roll
 
-                if auto_on:
+                # PID 更新（降落序列期间不更新 PID）
+                if auto_on and land_state is None:
                     out_throttle = pid_throttle.update(err_throttle, now)
                     out_pitch    = pid_pitch.update(err_pitch, now)
                     out_roll     = pid_roll.update(err_roll, now)
-                    last_pid_out = [out_roll, out_pitch, out_throttle]
+                    last_pid_out[0] = out_roll
+                    last_pid_out[1] = out_pitch
+                    last_pid_out[2] = out_throttle
+
+                    # ===== 自动降落触发检测 =====
+                    if (LAND_DIST_MIN <= dist <= LAND_DIST_MAX
+                            and abs(err_roll)  <= LAND_ERR_MAX
+                            and abs(err_pitch) <= LAND_ERR_MAX):
+                        land_state = "thrusting"
+                        land_thrust_start = now
 
                 cv2.polylines(frame, [c.astype(int)], True, (0, 255, 0), 2)
                 cv2.drawFrameAxes(frame, camera_matrix, None, rvec, tvec, TAG_SIZE)
                 cv2.drawMarker(frame, (int(tag_cx), int(tag_cy)),
                                (255, 255, 0), cv2.MARKER_CROSS, 20, 2)
 
-        # Tag 丢失处理
-        if not tag_detected and auto_on:
+        # Tag 丢失处理（降落序列期间不覆盖输出）
+        if not tag_detected and auto_on and land_state is None:
             if last_tag_time is not None:
                 if now - last_tag_time > TAG_HOLD_DURATION:
-                    # 超时：ROLL/PITCH 归中，油门保持安全悬停值
-                    last_pid_out = [0.0, 0.0, TAG_LOST_THROTTLE]
+                    last_pid_out[0] = 0.0
+                    last_pid_out[1] = 0.0
+                    last_pid_out[2] = TAG_LOST_THROTTLE
             else:
-                last_pid_out = [0.0, 0.0, TAG_LOST_THROTTLE]
+                last_pid_out[0] = 0.0
+                last_pid_out[1] = 0.0
+                last_pid_out[2] = TAG_LOST_THROTTLE
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rotated = cv2.warpAffine(frame, M, (new_w, new_h),
@@ -473,6 +514,18 @@ while running:
         screen.blit(no_signal_bg, (CAM_X, CAM_Y))
         no_signal_text = font.render("NO CAMERA SIGNAL", True, (255, 60, 60))
         screen.blit(no_signal_text, (CAM_X + 60, CAM_Y + 110))
+
+    # ===== 自动降落序列执行 =====
+    if land_state == "thrusting":
+        elapsed = now - land_thrust_start
+        if elapsed < LAND_THRUST_DUR:
+            # 满推力，ROLL/PITCH 归中
+            last_pid_out[0] = 0.0
+            last_pid_out[1] = 0.0
+            last_pid_out[2] = 1.0
+        else:
+            # 1 秒到，执行 disarm
+            do_disarm()
 
     # ===== 通道赋值 =====
     if auto_on:
@@ -544,11 +597,15 @@ while running:
     screen.blit(font.render("AUTO", True, (255, 255, 255)), (auto_rect.x + 18, auto_rect.y + 10))
 
     # ===== 状态文字 =====
-    if armed:
-        msg = "ARMED"
+    if land_state == "thrusting":
+        remaining = LAND_THRUST_DUR - (now - land_thrust_start)
+        msg   = f"LANDING... {remaining:.1f}s"
+        color = (255, 200, 0)
+    elif armed:
+        msg   = "ARMED"
         color = (50, 255, 50)
     else:
-        msg = "SAFE TO ARM" if throttle_low else "THROTTLE HIGH - CANNOT ARM"
+        msg   = "SAFE TO ARM" if throttle_low else "THROTTLE HIGH - CANNOT ARM"
         color = (200, 200, 50) if throttle_low else (255, 50, 50)
     screen.blit(font.render(msg, True, color), (200, 20))
 
@@ -575,31 +632,26 @@ while running:
     pid_y = PID_EDITOR_Y
 
     if not armed:
-        # ===== PID 编辑器（disarm 状态）=====
+        # PID 编辑器（disarm 状态）
         screen.blit(font.render("PID PARAMS  (click to edit)", True, (200, 200, 200)), (pid_x, pid_y))
 
-        # 表头
         for ci, col_name in enumerate(PID_COLS):
             hx = pid_x + 52 + ci * PID_COL_W + PID_COL_W // 2 - 10
             screen.blit(font_small.render(col_name, True, (180, 180, 180)), (hx, pid_y + 6))
 
         for ri, row_name in enumerate(PID_ROWS):
             ry = pid_y + 22 + ri * PID_ROW_H
-
-            # 行标签
             screen.blit(font_mono.render(row_name, True, (200, 220, 255)), (pid_x, ry + 3))
 
             for ci in range(len(PID_COLS)):
                 rect = get_pid_cell_rect(ri, ci)
                 is_selected = (selected_cell == (ri, ci))
 
-                # 背景
                 bg_color = (60, 80, 120) if is_selected else (45, 45, 55)
                 pygame.draw.rect(screen, bg_color, rect, border_radius=3)
                 pygame.draw.rect(screen, (120, 160, 255) if is_selected else (80, 80, 100),
                                  rect, 1, border_radius=3)
 
-                # 数值或输入缓冲
                 if is_selected:
                     display_str = edit_buffer + "|"
                     txt_color = (255, 255, 100)
@@ -614,16 +666,19 @@ while running:
                     (pid_x, pid_y + 22 + len(PID_ROWS) * PID_ROW_H + 4))
 
     elif auto_on:
-        # ===== PID 误差显示（AUTO 运行中）=====
-        if tag_detected:
+        # PID 误差显示（AUTO 运行中）
+        if land_state == "thrusting":
+            tag_status       = "LANDING SEQUENCE"
+            tag_status_color = (255, 200, 0)
+        elif tag_detected:
+            tag_status       = "TAG: LOCKED"
             tag_status_color = (50, 255, 50)
-            tag_status = "TAG: LOCKED"
         elif last_tag_time is not None and (now - last_tag_time) <= TAG_HOLD_DURATION:
             tag_status_color = (255, 200, 0)
-            tag_status = f"TAG: HOLD ({TAG_HOLD_DURATION - (now - last_tag_time):.1f}s)"
+            tag_status       = f"TAG: HOLD ({TAG_HOLD_DURATION - (now - last_tag_time):.1f}s)"
         else:
+            tag_status       = "TAG: LOST"
             tag_status_color = (255, 60, 60)
-            tag_status = "TAG: LOST"
 
         screen.blit(font.render(tag_status, True, tag_status_color),                        (pid_x, pid_y))
         screen.blit(font_small.render(f"ERR THRO:  {err_throttle_disp:+.3f} m", True, (180, 220, 255)), (pid_x, pid_y + 24))

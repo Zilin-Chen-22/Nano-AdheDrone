@@ -34,16 +34,16 @@ TAG_HOLD_DURATION = 0.05
 TAG_LOST_THROTTLE = -0.2
 
 # 自动降落触发条件
-LAND_DIST_MIN   = 0.3    # 触发距离下限（米）
-LAND_DIST_MAX   = 0.4    # 触发距离上限（米）
-LAND_ERR_MAX    = 0.1    # XY 方向误差上限（归一化）
-LAND_THRUST_DUR = 1.0    # 满推力持续时间（秒）
+LAND_DIST_MIN   = 0.3
+LAND_DIST_MAX   = 0.45
+LAND_ERR_MAX    = 0.15
+LAND_THRUST_DUR = 0.5
 
 # 各轴 PID 参数（运行时可在界面调整）
 pid_params = {
-    "THRO":  [0.45,  0.120,  0.10],
-    "PITCH": [0.72,  0.004,  0.06],
-    "ROLL":  [0.72,  0.004,  0.06],
+    "THRO":  [0.45,  0.120,  0.11],
+    "PITCH": [0.30,  0.000,  0.20],
+    "ROLL":  [0.30,  0.000,  0.20],
 }
 
 # 各轴 PID 输出限幅（归一化 [-1, 1]）
@@ -195,12 +195,14 @@ dragging = [False] * 4
 
 # ========= 按钮 =========
 arm_request = False
-angle_on = False
-auto_on = False
+angle_on    = False
+auto_on     = False
+stick_on    = False   # AUX4 控制
 
 arm_rect   = pygame.Rect(BUTTON_X, 60,  80, 40)
 angle_rect = pygame.Rect(BUTTON_X, 110, 80, 40)
 auto_rect  = pygame.Rect(BUTTON_X, 160, 80, 40)
+stick_rect = pygame.Rect(BUTTON_X, 210, 80, 40)   # 新增 STICK 按钮
 
 # ========= 串口 =========
 ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0)
@@ -225,20 +227,17 @@ err_throttle_disp = 0.0
 current_dist      = 0.0
 
 # ========= 自动降落序列状态 =========
-# land_state: None → "thrusting" → 自动 disarm
-land_state      = None
-land_thrust_start = None   # 满推力开始时间
+land_state        = None
+land_thrust_start = None
 
 
 def abort_land():
-    """中断降落序列，重置状态"""
     global land_state, land_thrust_start
     land_state = None
     land_thrust_start = None
 
 
 def do_disarm():
-    """执行 disarm 并重置所有相关状态"""
     global armed, arm_request, auto_on, land_state, land_thrust_start
     arm_request = False
     armed = False
@@ -334,20 +333,18 @@ while running:
                     selected_cell = None
                     edit_buffer = ""
 
-            # ARM 按钮（最高优先级，可中断降落序列）
+            # ARM
             if arm_rect.collidepoint(mx, my):
                 if armed:
-                    # 手动 disarm，中断一切
                     do_disarm()
                 else:
                     if throttle_low:
                         arm_request = True
 
-            # AUTO 按钮（可中断降落序列）
+            # AUTO
             if auto_rect.collidepoint(mx, my):
                 if armed:
                     if auto_on:
-                        # 手动关闭 auto，中断降落序列
                         auto_on = False
                         abort_land()
                         pid_throttle.reset()
@@ -359,8 +356,13 @@ while running:
                     else:
                         auto_on = True
 
+            # ANGLE
             if angle_rect.collidepoint(mx, my):
                 angle_on = not angle_on
+
+            # STICK（随时可切换）
+            if stick_rect.collidepoint(mx, my):
+                stick_on = not stick_on
 
             for i in range(4):
                 rect = pygame.Rect(
@@ -456,7 +458,6 @@ while running:
                 err_pitch_disp    = err_pitch
                 err_roll_disp     = err_roll
 
-                # PID 更新（降落序列期间不更新 PID）
                 if auto_on and land_state is None:
                     out_throttle = pid_throttle.update(err_throttle, now)
                     out_pitch    = pid_pitch.update(err_pitch, now)
@@ -465,7 +466,6 @@ while running:
                     last_pid_out[1] = out_pitch
                     last_pid_out[2] = out_throttle
 
-                    # ===== 自动降落触发检测 =====
                     if (LAND_DIST_MIN <= dist <= LAND_DIST_MAX
                             and abs(err_roll)  <= LAND_ERR_MAX
                             and abs(err_pitch) <= LAND_ERR_MAX):
@@ -477,7 +477,6 @@ while running:
                 cv2.drawMarker(frame, (int(tag_cx), int(tag_cy)),
                                (255, 255, 0), cv2.MARKER_CROSS, 20, 2)
 
-        # Tag 丢失处理（降落序列期间不覆盖输出）
         if not tag_detected and auto_on and land_state is None:
             if last_tag_time is not None:
                 if now - last_tag_time > TAG_HOLD_DURATION:
@@ -519,12 +518,10 @@ while running:
     if land_state == "thrusting":
         elapsed = now - land_thrust_start
         if elapsed < LAND_THRUST_DUR:
-            # 满推力，ROLL/PITCH 归中
             last_pid_out[0] = 0.0
             last_pid_out[1] = 0.0
             last_pid_out[2] = 1.0
         else:
-            # 1 秒到，执行 disarm
             do_disarm()
 
     # ===== 通道赋值 =====
@@ -547,8 +544,9 @@ while running:
     if not arm_request:
         armed = False
 
-    ch[5] = CRSF_MID if armed else CRSF_LOW
-    ch[6] = CRSF_MID if angle_on else CRSF_LOW
+    ch[5] = CRSF_MID if armed   else CRSF_LOW   # AUX1 - ARM
+    ch[6] = CRSF_MID if angle_on else CRSF_LOW   # AUX2 - ANGLE
+    ch[7] = CRSF_MID if stick_on else CRSF_LOW   # AUX4 - STICK（1500 开，172 关）
 
     # ===== 发送 =====
     if now - last_send > 1.0 / SEND_HZ:
@@ -575,6 +573,7 @@ while running:
         screen.blit(label, (x - 35, y_bottom + 10))
 
     # ===== 按钮绘制 =====
+    # ARM
     if armed:
         arm_color = (0, 200, 0)
     elif arm_request:
@@ -584,9 +583,11 @@ while running:
     pygame.draw.rect(screen, arm_color, arm_rect)
     screen.blit(font.render("ARM", True, (255, 255, 255)), (arm_rect.x + 20, arm_rect.y + 10))
 
+    # ANGLE
     pygame.draw.rect(screen, (0, 200, 0) if angle_on else (120, 0, 0), angle_rect)
     screen.blit(font.render("ANGLE", True, (255, 255, 255)), (angle_rect.x + 10, angle_rect.y + 10))
 
+    # AUTO
     if not armed:
         auto_color = (60, 60, 60)
     elif auto_on:
@@ -595,6 +596,10 @@ while running:
         auto_color = (120, 0, 0)
     pygame.draw.rect(screen, auto_color, auto_rect)
     screen.blit(font.render("AUTO", True, (255, 255, 255)), (auto_rect.x + 18, auto_rect.y + 10))
+
+    # STICK（随时可切换，颜色同 ANGLE）
+    pygame.draw.rect(screen, (0, 200, 0) if stick_on else (120, 0, 0), stick_rect)
+    screen.blit(font.render("STICK", True, (255, 255, 255)), (stick_rect.x + 10, stick_rect.y + 10))
 
     # ===== 状态文字 =====
     if land_state == "thrusting":
@@ -632,7 +637,6 @@ while running:
     pid_y = PID_EDITOR_Y
 
     if not armed:
-        # PID 编辑器（disarm 状态）
         screen.blit(font.render("PID PARAMS  (click to edit)", True, (200, 200, 200)), (pid_x, pid_y))
 
         for ci, col_name in enumerate(PID_COLS):
@@ -666,7 +670,6 @@ while running:
                     (pid_x, pid_y + 22 + len(PID_ROWS) * PID_ROW_H + 4))
 
     elif auto_on:
-        # PID 误差显示（AUTO 运行中）
         if land_state == "thrusting":
             tag_status       = "LANDING SEQUENCE"
             tag_status_color = (255, 200, 0)

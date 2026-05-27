@@ -37,7 +37,8 @@ TAG_LOST_THROTTLE = -0.2
 LAND_DIST_MIN   = 0.3
 LAND_DIST_MAX   = 0.45
 LAND_ERR_MAX    = 0.15
-LAND_THRUST_DUR = 0.5
+LAND_THRUST_DUR = 0.5   # 冲顶时间
+LAND_STICK_ON = 0.2     # 延迟打开电流变液时间
 
 # 各轴 PID 参数（运行时可在界面调整）
 pid_params = {
@@ -517,12 +518,14 @@ while running:
     # ===== 自动降落序列执行 =====
     if land_state == "thrusting":
         elapsed = now - land_thrust_start
+        if elapsed >= LAND_STICK_ON:
+            stick_on = True          # 0.2s 后打开 stick
         if elapsed < LAND_THRUST_DUR:
             last_pid_out[0] = 0.0
             last_pid_out[1] = 0.0
             last_pid_out[2] = 1.0
         else:
-            do_disarm()
+            do_disarm()              # 0.5s 后 disarm，stick_on 不动
 
     # ===== 通道赋值 =====
     if auto_on:
